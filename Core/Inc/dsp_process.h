@@ -6,6 +6,8 @@
 #define FFT_LEN 4096
 #define FS 500000.0f
 #define V_SOUND 1500.0f
+// 发射期间 blanking：发射脉宽 1ms = 500 点，多留 0.2ms 余量 = 600 点
+#define BLANK_IDX 600
 
 // 处理状态枚举
 typedef enum {

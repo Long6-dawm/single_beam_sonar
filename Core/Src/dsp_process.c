@@ -50,8 +50,14 @@ DSP_Status_t DSP_RunMatchFilter(uint16_t* raw_data, float32_t* distance) {
     uint32_t peak_idx;
 
     // 1. 预处理：uint16 转 float 并去直流 (2048 为 12位 ADC 中值)
+    //    发射串扰置零：前 BLANK_IDX 点（覆盖发射窗口）直接置 0，
+    //    避免发射波形串到接收端形成的相关峰（index≈0）干扰寻峰
     for (uint16_t i = 0; i < FFT_LEN; i++) {
-        dsp_buffer_a[i] = (float32_t)raw_data[i] - 2048.0f;
+        if (i < BLANK_IDX) {
+            dsp_buffer_a[i] = 0.0f;
+        } else {
+            dsp_buffer_a[i] = (float32_t)raw_data[i] - 2048.0f;
+        }
     }
 
     // 2. 正向 FFT (实数)
