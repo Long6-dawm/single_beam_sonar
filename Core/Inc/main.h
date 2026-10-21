@@ -61,6 +61,9 @@ void Error_Handler(void);
 #define LED0_GPIO_Port GPIOF
 #define LED1_Pin GPIO_PIN_10
 #define LED1_GPIO_Port GPIOF
+#define SYNC_IN_Pin GPIO_PIN_1
+#define SYNC_IN_GPIO_Port GPIOC
+#define SYNC_IN_EXTI_IRQn EXTI1_IRQn
 
 /* USER CODE BEGIN Private defines */
 

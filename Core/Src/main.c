@@ -42,7 +42,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+// 接收调试（分置换能器）置零长度：接收端不发射、无电串扰，默认不置零。
+// 若功放 EMI 在起始处造成尖峰，可改为 20~50（须远小于直达波 index，如 0.3m≈100）。
+#define RX_DEBUG_BLANK 0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -68,6 +70,15 @@ LED_Blinker_t blinker0 = {GPIOF, GPIO_PIN_9, 0, 0};
 LED_Blinker_t blinker1 = {GPIOF, GPIO_PIN_10, 0, 0};
 
 volatile uint8_t sim_mode = 0; // 增加 volatile 确保调试器修改后 CPU 能立即察觉
+
+// ===== 调试模式相关状态 =====
+volatile uint8_t tx_debug = 0;          // 发射调试激活
+volatile uint8_t rx_debug = 0;          // 接收调试激活
+volatile uint8_t sync_flag = 0;         // AWG Sync 触发标志（PC1 EXTI 置位）
+volatile uint16_t tx_period_ms = 100;   // 发射重复周期(ms)，默认100
+volatile uint32_t last_tx_tick = 0;     // 上次发射时刻
+volatile uint8_t dump_request = 0;      // 请求导出一帧 raw
+volatile uint8_t rx_expect_period = 0;  // 1=等待接收周期参数(2字节)
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -81,6 +92,21 @@ void SystemClock_Config(void);
 void Start_Blink(LED_Blinker_t* b) {
     b->count = 10;     // 设置翻转10次（5次亮灭）
     b->is_active = 1;
+}
+
+// 将 adc_raw[4096] 以二进制帧导出：AA 55 | len(2字节小端,=4096) | 4096*uint16(小端)
+void Dump_ADC_Raw(void) {
+    uint8_t hdr[4] = {0xAA, 0x55, 0x00, 0x10}; // 0x1000 = 4096 样本数
+    HAL_UART_Transmit(&huart1, hdr, 4, 100);
+
+    uint8_t* p = (uint8_t*)adc_raw;
+    uint32_t len = sizeof(adc_raw); // 8192 字节
+    uint32_t sent = 0;
+    while (sent < len) {
+        uint32_t chunk = (len - sent) > 256 ? 256 : (len - sent);
+        HAL_UART_Transmit(&huart1, p + sent, chunk, 1000);
+        sent += chunk;
+    }
 }
 /* USER CODE END 0 */
 
@@ -157,57 +183,74 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    // 逻辑：真实采集完成 OR 手动触发仿真
-    if (adc_complete_flag || sim_mode == 1) 
+    // ===== 发射调试：按周期反复发送 LFM =====
+    if (tx_debug)
     {
-        if (sim_mode == 1) 
+        if ((HAL_GetTick() - last_tx_tick) >= tx_period_ms)
         {
-            HAL_ADC_Stop_DMA(&hadc1); // 必须先停掉正在跑的 DMA
-            
-            // 注入 MATLAB 数据 (确保 test_echo.h 已包含)
-            memcpy(adc_raw, matlab_sim_echo, sizeof(uint16_t) * 4096); // 执行内存拷贝
-            
-            // 调试信息：确认数据注入成功 （可以在串口助手看到，如果是屏幕，则应该注释以下调试信息）
-            // HAL_UART_Transmit(&huart1, (uint8_t*)"[SIM] Data Injected\r\n", 21, 100);
+            HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t*)LFM_SIGNAL, LFM_DATA_LEN, DAC_ALIGN_12B_R);
+            last_tx_tick = HAL_GetTick();
         }
+    }
 
-        float32_t result_dist = 0;
-        if (DSP_RunMatchFilter(adc_raw, &result_dist) == DSP_SUCCESS) 
-        {
-            // --- 1. 打印给电脑串口助手看的调试信息（保留这个好习惯） ---
-            // char log_buf[64];
-            // int m = (int)result_dist;
-            // int mm = (int)((result_dist - m) * 1000);
-            // snprintf(log_buf, sizeof(log_buf), "Result: %d.%03d m\r\n", m, mm);
-            // HAL_UART_Transmit(&huart1, (uint8_t*)log_buf, strlen(log_buf), 100);
+    // ===== 接收调试：AWG Sync 触发一次采集 =====
+    if (rx_debug && sync_flag)
+    {
+        sync_flag = 0;
+        HAL_ADC_Stop_DMA(&hadc1);
+        HAL_TIM_Base_Start(&htim2);                     // 启动 500kHz 触发
+        HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 4096);
+    }
 
-            // ==========================================================
-            // --- 2. 发送给串口屏的控制指令 ---
-            // ==========================================================
-            
-            char screen_buf[32];
-
-            // 把真实测出的距离（比如 4999 毫米）发给屏幕的 x0 控件（推荐）
-            int dist_mm = (int)(result_dist * 1000); // 将米转换为毫米，串口屏的 val 通常只能接整数
-            snprintf(screen_buf, sizeof(screen_buf), "x0.val=%d", dist_mm);
-
-            // 第一步：通过字符串模式发送 "x0.val=..."
-            HAL_UART_Transmit(&huart1, (uint8_t*)screen_buf, strlen(screen_buf), 100);
-
-            // 第二步：通过 HEX 模式发送三个 0xFF 结束符
-            uint8_t end_cmd[3] = {0xFF, 0xFF, 0xFF};
-            HAL_UART_Transmit(&huart1, end_cmd, 3, 100);
-        }
-
-        if (sim_mode == 1) 
-        {
-            sim_mode = 0; // 自动复位，防止无限循环仿真
-            HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 4096); // 恢复真实采集
-        }
+    // ===== 采集完成处理 =====
+    if (adc_complete_flag || (sim_mode == 1 && !rx_debug && !tx_debug))
+    {
         adc_complete_flag = 0;
 
-        // 非仿真模式下，采集完成后直接重启 ADC DMA，准备下一轮采集
-        HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 4096);
+        if (rx_debug)
+        {
+            // 接收调试：跑 DSP，上报峰值/距离，等待下一个 sync
+            float32_t result_dist = 0;
+            uint32_t pk = 0;
+            if (DSP_RunMatchFilter(adc_raw, &result_dist, &pk, RX_DEBUG_BLANK) == DSP_SUCCESS)
+            {
+                char dbg[64];
+                snprintf(dbg, sizeof(dbg), "RX peak=%lu, dist=%.3f m\r\n",
+                         (unsigned long)pk, (double)result_dist);
+                HAL_UART_Transmit(&huart1, (uint8_t*)dbg, strlen(dbg), 100);
+            }
+        }
+        else
+        {
+            // 正常 / 仿真模式
+            if (sim_mode == 1)
+            {
+                sim_mode = 0;
+                HAL_ADC_Stop_DMA(&hadc1);
+                memcpy(adc_raw, matlab_sim_echo, sizeof(uint16_t) * 4096);
+            }
+
+            float32_t result_dist = 0;
+            if (DSP_RunMatchFilter(adc_raw, &result_dist, NULL, BLANK_IDX) == DSP_SUCCESS)
+            {
+                char screen_buf[32];
+                int dist_mm = (int)(result_dist * 1000);
+                snprintf(screen_buf, sizeof(screen_buf), "x0.val=%d", dist_mm);
+                HAL_UART_Transmit(&huart1, (uint8_t*)screen_buf, strlen(screen_buf), 100);
+                uint8_t end_cmd[3] = {0xFF, 0xFF, 0xFF};
+                HAL_UART_Transmit(&huart1, end_cmd, 3, 100);
+            }
+
+            // 重新进入 ADC 待命，准备下一轮
+            HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 4096);
+        }
+    }
+
+    // ===== 导出原始 ADC 数据 =====
+    if (dump_request)
+    {
+        dump_request = 0;
+        Dump_ADC_Raw();
     }
     /* USER CODE END WHILE */
 
@@ -289,29 +332,121 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if(huart->Instance == USART1) // 确保是对应的串口
     {
-        // 1. 立即原样发回给电脑，确认通信是否正常
-        HAL_UART_Transmit(huart, rx_data, 2, 100);
-        
-        // 2. 只有回显正常了，下面的控制逻辑才有意义
-        if(rx_data[0] == 0x0D) 
+        if(rx_expect_period)
         {
-            if(rx_data[1] == 0x00) {
-                Start_Blink(&blinker0);
-            }
-            else if(rx_data[1] == 0x01) {
-                Start_Blink(&blinker1);
-                HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t*)LFM_SIGNAL, LFM_DATA_LEN, DAC_ALIGN_12B_R);
-                HAL_TIM_Base_Start(&htim2);
+            // 收到周期参数：2 字节小端(ms)
+            tx_period_ms = rx_data[0] | ((uint16_t)rx_data[1] << 8);
+            if(tx_period_ms < 1) tx_period_ms = 1;
+            rx_expect_period = 0;
+        }
+        else if(rx_data[0] == 0x0D)
+        {
+            switch(rx_data[1])
+            {
+                case 0x00: // LED0 闪烁
+                    Start_Blink(&blinker0);
+                    break;
+
+                case 0x01: // 单次发射（正常测距）
+                    Start_Blink(&blinker1);
+                    HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t*)LFM_SIGNAL, LFM_DATA_LEN, DAC_ALIGN_12B_R);
+                    HAL_TIM_Base_Start(&htim2);
+                    break;
+
+                case 0x02: // 进入调试模式（占位）
+                    break;
+
+                case 0x03: // 发射调试开始
+                    rx_debug = 0;
+                    HAL_ADC_Stop_DMA(&hadc1);       // 停 ADC，避免干扰
+                    HAL_TIM_Base_Start(&htim2);     // TIM2 常开触发 DAC
+                    tx_debug = 1;
+                    last_tx_tick = HAL_GetTick();
+                    break;
+
+                case 0x04: // 发射调试停止
+                    tx_debug = 0;
+                    HAL_TIM_Base_Stop(&htim2);
+                    HAL_DAC_Stop_DMA(&hdac, DAC_CHANNEL_1);
+                    HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
+                    HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 2048);
+                    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 4096);
+                    break;
+
+                case 0x05: // 接收调试开始
+                    tx_debug = 0;
+                    HAL_TIM_Base_Stop(&htim2);
+                    HAL_DAC_Stop_DMA(&hdac, DAC_CHANNEL_1);
+                    HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
+                    HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 2048);
+                    HAL_ADC_Stop_DMA(&hadc1);
+                    rx_debug = 1;
+                    sync_flag = 0;
+                    break;
+
+                case 0x06: // 接收调试停止
+                    rx_debug = 0;
+                    HAL_TIM_Base_Stop(&htim2);
+                    HAL_ADC_Stop_DMA(&hadc1);
+                    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 4096);
+                    break;
+
+                case 0x07: // 退出调试，回正常模式
+                    tx_debug = 0;
+                    rx_debug = 0;
+                    HAL_TIM_Base_Stop(&htim2);
+                    HAL_DAC_Stop_DMA(&hdac, DAC_CHANNEL_1);
+                    HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
+                    HAL_DAC_SetValue(&hdac, DAC_CHANNEL_1, DAC_ALIGN_12B_R, 2048);
+                    HAL_ADC_Stop_DMA(&hadc1);
+                    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 4096);
+                    break;
+
+                case 0x08: // 设置发射周期，等待 2 字节参数
+                    rx_expect_period = 1;
+                    break;
+
+                case 0x09: // 导出一帧 raw
+                    dump_request = 1;
+                    break;
+
+                default:
+                    break;
             }
         }
 
-        // 3. 重新启动中断接收，否则只会触发一次
+        HAL_UART_Receive_IT(huart, rx_data, 2);
+    }
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if(GPIO_Pin == SYNC_IN_Pin)
+    {
+        sync_flag = 1; // AWG Sync 上升沿，请求一次采集
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if(huart->Instance == USART1)
+    {
+        // 溢出(ORE)等错误会中止接收，这里清标志并重新使能接收，避免"收一次后死机"
+        __HAL_UART_CLEAR_OREFLAG(huart);
         HAL_UART_Receive_IT(huart, rx_data, 2);
     }
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
-    HAL_TIM_Base_Stop(&htim2); // 停止采样
+    if(tx_debug) {
+        return; // 发射调试不关心回波（ADC 已停用）
+    }
+    if(rx_debug) {
+        HAL_TIM_Base_Stop(&htim2); // 收完这一帧就停，等下一个 sync
+        adc_complete_flag = 1;
+        return;
+    }
+    HAL_TIM_Base_Stop(&htim2); // 正常模式：停止采样
     adc_complete_flag = 1;     // 置标志位
 }
 /* USER CODE END 4 */

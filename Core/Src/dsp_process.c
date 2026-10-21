@@ -43,17 +43,18 @@ void DSP_Init(void) {
  * @brief 执行匹配滤波（脉冲压缩）
  * @param raw_data 输入的 ADC 原始数据指针
  * @param distance 输出计算得到的距离结果
+ * @param peak_index 输出相关峰索引（可传 NULL）
+ * @param blank_samples 匹配滤波前置零的采样点数（0 表示不置零）
  * @return 处理状态
  */
-DSP_Status_t DSP_RunMatchFilter(uint16_t* raw_data, float32_t* distance) {
+DSP_Status_t DSP_RunMatchFilter(uint16_t* raw_data, float32_t* distance, uint32_t* peak_index, uint16_t blank_samples) {
     float32_t max_val;
     uint32_t peak_idx;
 
     // 1. 预处理：uint16 转 float 并去直流 (2048 为 12位 ADC 中值)
-    //    发射串扰置零：前 BLANK_IDX 点（覆盖发射窗口）直接置 0，
-    //    避免发射波形串到接收端形成的相关峰（index≈0）干扰寻峰
+    //    前 blank_samples 点直接置 0（单站用于抑制发射电串扰；分置接收调试可传 0）
     for (uint16_t i = 0; i < FFT_LEN; i++) {
-        if (i < BLANK_IDX) {
+        if (i < blank_samples) {
             dsp_buffer_a[i] = 0.0f;
         } else {
             dsp_buffer_a[i] = (float32_t)raw_data[i] - 2048.0f;
@@ -76,8 +77,11 @@ DSP_Status_t DSP_RunMatchFilter(uint16_t* raw_data, float32_t* distance) {
     // 5. 取模/绝对值（提取包络）
     arm_abs_f32(dsp_buffer_a, dsp_buffer_a, FFT_LEN);
 
-    // 6. 寻峰：在整个 16384 长度内找能量最大的点
+    // 6. 寻峰：在整个 4096 长度内找能量最大的点
     arm_max_f32(dsp_buffer_a, FFT_LEN, &max_val, &peak_idx);
+    if (peak_index != NULL) {
+        *peak_index = peak_idx;
+    }
 
     // 7. 距离计算
     // 距离 = (索引 / 采样率) * 声速 / 2
