@@ -89,3 +89,11 @@ DSP_Status_t DSP_RunMatchFilter(uint16_t* raw_data, float32_t* distance, uint32_
 
     return DSP_SUCCESS;
 }
+
+/**
+ * @brief 获取最近一次匹配滤波输出（4096 点，取模后的幅度）
+ * @return 指向内部缓冲的只读指针（下次调用 DSP_RunMatchFilter 会被覆盖）
+ */
+const float32_t* DSP_GetMatchOutput(void) {
+    return dsp_buffer_a;
+}

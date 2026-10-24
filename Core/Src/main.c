@@ -79,6 +79,8 @@ volatile uint16_t tx_period_ms = 100;   // 发射重复周期(ms)，默认100
 volatile uint32_t last_tx_tick = 0;     // 上次发射时刻
 volatile uint8_t dump_request = 0;      // 请求导出一帧 raw
 volatile uint8_t rx_expect_period = 0;  // 1=等待接收周期参数(2字节)
+volatile uint8_t adc_acquiring = 0;     // 1=正在采集（防止页面3画到半帧）
+volatile uint8_t wave_pending = 0;      // 请求在页面3显示最近一帧波形
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -107,6 +109,94 @@ void Dump_ADC_Raw(void) {
         HAL_UART_Transmit(&huart1, p + sent, chunk, 1000);
         sent += chunk;
     }
+}
+
+/* ---------- 淘晶驰串口屏命令辅助（页面3波形/文本） ---------- */
+// 发送一条淘晶驰命令，自动追加 FF FF FF 结束符
+static void TJC_Send(const char* cmd) {
+    HAL_UART_Transmit(&huart1, (uint8_t*)cmd, strlen(cmd), 100);
+    uint8_t end[3] = {0xFF, 0xFF, 0xFF};
+    HAL_UART_Transmit(&huart1, end, 3, 100);
+}
+
+static void Wave_Clear(const char* obj, uint8_t ch) {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "cle %s,%d", obj, (int)ch);
+    TJC_Send(buf);
+}
+
+static void Wave_Add(const char* obj, uint8_t ch, uint8_t val) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "add %s,%d,%d", obj, (int)ch, (int)val);
+    TJC_Send(buf);
+}
+
+static void Text_Set(const char* obj, const char* txt) {
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%s.txt=\"%s\"", obj, txt);
+    TJC_Send(buf);
+}
+
+// 在页面3显示"最近一帧"：s0=原始包络, s1=匹配输出, v_vpp/v_peak/v_dist=文本
+// 调用前应确保 adc_raw 与 DSP 匹配输出属于同一完整帧（见 adc_acquiring 保护）
+void Display_Debug_Curves(void) {
+    const uint16_t N = 512;              // 波形点数
+    const uint16_t STEP = FFT_LEN / N;   // 4096/512 = 8
+    const float32_t* match = DSP_GetMatchOutput();
+
+    // 1) 匹配输出峰值（索引 + 幅度）—— 与 s1 曲线严格对应
+    float32_t peak_amp = 0.0f;
+    uint32_t peak_idx = 0;
+    for (uint32_t i = 0; i < FFT_LEN; i++) {
+        if (match[i] > peak_amp) { peak_amp = match[i]; peak_idx = i; }
+    }
+
+    // 2) 原始时域 Vpp（伏特）与距离
+    uint16_t raw_min = 4095, raw_max = 0;
+    for (uint32_t i = 0; i < FFT_LEN; i++) {
+        if (adc_raw[i] < raw_min) raw_min = adc_raw[i];
+        if (adc_raw[i] > raw_max) raw_max = adc_raw[i];
+    }
+    float32_t vpp  = (float32_t)(raw_max - raw_min) * 3.3f / 4096.0f;
+    float32_t dist = ((float32_t)peak_idx / FS) * V_SOUND / 2.0f;
+
+    // 3) 清波形
+    Wave_Clear("s0", 0);
+    Wave_Clear("s1", 0);
+
+    // 4) 每 8 点合并为 1 点，交替发送两条曲线
+    for (uint16_t n = 0; n < N; n++) {
+        uint16_t base = n * STEP;
+
+        // s0：原始包络 = 组内 max(|adc-2048|)，缩放到 0~255
+        uint16_t env = 0;
+        for (uint16_t k = 0; k < STEP; k++) {
+            int32_t v = (int32_t)adc_raw[base + k] - 2048;
+            if (v < 0) v = -v;
+            if ((uint16_t)v > env) env = (uint16_t)v;
+        }
+        uint8_t val0 = (uint8_t)((uint32_t)env * 255U / 2048U);
+
+        // s1：匹配输出 = 组内最大，按本帧峰值归一化到 0~255
+        float32_t m = 0.0f;
+        for (uint16_t k = 0; k < STEP; k++) {
+            float32_t v = match[base + k];
+            if (v > m) m = v;
+        }
+        uint8_t val1 = (peak_amp > 0.0f) ? (uint8_t)(m / peak_amp * 255.0f) : 0U;
+
+        Wave_Add("s0", 0, val0);
+        Wave_Add("s1", 0, val1);
+    }
+
+    // 5) 文本
+    char tbuf[24];
+    snprintf(tbuf, sizeof(tbuf), "%.3fV", (double)vpp);
+    Text_Set("v_vpp", tbuf);
+    snprintf(tbuf, sizeof(tbuf), "%lu", (unsigned long)peak_idx);
+    Text_Set("v_peak", tbuf);
+    snprintf(tbuf, sizeof(tbuf), "%.3fm", (double)dist);
+    Text_Set("v_dist", tbuf);
 }
 /* USER CODE END 0 */
 
@@ -200,6 +290,7 @@ int main(void)
         HAL_ADC_Stop_DMA(&hadc1);
         HAL_TIM_Base_Start(&htim2);                     // 启动 500kHz 触发
         HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_raw, 4096);
+        adc_acquiring = 1;                              // 标记采集中
     }
 
     // ===== 采集完成处理 =====
@@ -209,16 +300,10 @@ int main(void)
 
         if (rx_debug)
         {
-            // 接收调试：跑 DSP，上报峰值/距离，等待下一个 sync
+            // 接收调试：跑 DSP 填充匹配输出，等下一个 sync（不向屏幕发连续文本）
             float32_t result_dist = 0;
             uint32_t pk = 0;
-            if (DSP_RunMatchFilter(adc_raw, &result_dist, &pk, RX_DEBUG_BLANK) == DSP_SUCCESS)
-            {
-                char dbg[64];
-                snprintf(dbg, sizeof(dbg), "RX peak=%lu, dist=%.3f m\r\n",
-                         (unsigned long)pk, (double)result_dist);
-                HAL_UART_Transmit(&huart1, (uint8_t*)dbg, strlen(dbg), 100);
-            }
+            DSP_RunMatchFilter(adc_raw, &result_dist, &pk, RX_DEBUG_BLANK);
         }
         else
         {
@@ -251,6 +336,13 @@ int main(void)
     {
         dump_request = 0;
         Dump_ADC_Raw();
+    }
+
+    // ===== 页面3显示最近一帧波形（按需，保证同一完整帧） =====
+    if (wave_pending && !adc_acquiring)
+    {
+        wave_pending = 0;
+        Display_Debug_Curves();
     }
     /* USER CODE END WHILE */
 
@@ -351,6 +443,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                     Start_Blink(&blinker1);
                     HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t*)LFM_SIGNAL, LFM_DATA_LEN, DAC_ALIGN_12B_R);
                     HAL_TIM_Base_Start(&htim2);
+                    adc_acquiring = 1; // 标记采集中
                     break;
 
                 case 0x02: // 进入调试模式（占位）
@@ -410,6 +503,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                     dump_request = 1;
                     break;
 
+                case 0x0B: // 页面3显示最近一帧波形（原始包络 + 匹配输出 + 文本）
+                    wave_pending = 1;
+                    break;
+
                 default:
                     break;
             }
@@ -438,6 +535,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    adc_acquiring = 0; // 采集完成
     if(tx_debug) {
         return; // 发射调试不关心回波（ADC 已停用）
     }

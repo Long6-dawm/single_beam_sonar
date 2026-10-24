@@ -20,5 +20,6 @@ typedef enum {
 // 外部调用接口
 void DSP_Init(void);
 DSP_Status_t DSP_RunMatchFilter(uint16_t* raw_data, float32_t* distance, uint32_t* peak_index, uint16_t blank_samples);
+const float32_t* DSP_GetMatchOutput(void);   // 最近一次匹配滤波输出(4096点，取模后)
 
 #endif
